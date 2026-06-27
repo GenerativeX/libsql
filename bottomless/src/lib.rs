@@ -4,6 +4,7 @@
 
 mod backup;
 pub mod bottomless_wal;
+pub mod store;
 mod completion_progress;
 pub mod read;
 pub mod replicator;
