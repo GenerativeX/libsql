@@ -171,11 +171,20 @@ impl BlobStore {
         max: Option<usize>,
         start_after: Option<&str>,
     ) -> Result<Vec<ObjMeta>> {
+        // `object_store::list(prefix)` matches at path-delimiter (`/`) boundaries,
+        // but bottomless uses *partial-component* string prefixes (e.g. `"{db}-"`
+        // to match `"{db}-{uuid}/..."`). To recover S3 `ListObjects(prefix=..)`
+        // semantics we list the closest path-aligned ancestor (everything up to
+        // the last `/`, or the whole store) and filter by the raw string prefix.
+        let aligned = prefix.rfind('/').map(|i| obj_path(&prefix[..i]));
         let mut out = Vec::new();
-        let mut stream = self.inner.list(Some(&obj_path(prefix)));
+        let mut stream = self.inner.list(aligned.as_ref());
         while let Some(meta) = stream.next().await {
             let meta = meta?;
             let key = meta.location.as_ref().to_string();
+            if !key.starts_with(prefix) {
+                continue;
+            }
             if let Some(sa) = start_after {
                 if key.as_str() <= sa {
                     continue;
