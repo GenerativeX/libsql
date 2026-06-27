@@ -45,7 +45,7 @@ pub type Result<T> = anyhow::Result<T>;
 
 #[derive(Debug)]
 pub struct Replicator {
-    pub client: Client,
+    pub store: crate::store::BlobStore,
 
     /// Frame number, incremented whenever a new frame is written from SQLite.
     next_frame_no: Arc<AtomicU32>,
@@ -105,6 +105,11 @@ pub struct Options {
     pub session_token: Option<String>,
     pub region: Option<String>,
     pub db_id: Option<String>,
+    /// Storage backend: `s3` (default) or `azure`. Selected by
+    /// `LIBSQL_BOTTOMLESS_PROVIDER`. For `azure`, `access_key_id` carries the
+    /// storage account name and `secret_access_key` the account key, and
+    /// `bucket_name` is the container.
+    pub provider: Option<String>,
     /// Bucket directory name where all S3 objects are backed up. General schema is:
     /// - `{db-name}-{uuid-v7}` subdirectories:
     ///   - `.meta` file with database page size and initial WAL checksum.
@@ -128,15 +133,11 @@ pub struct Options {
 }
 
 impl Options {
-    pub async fn client_config(&self) -> Result<Config> {
-        let mut loader = aws_config::SdkConfig::builder();
-        if let Some(endpoint) = self.aws_endpoint.as_deref() {
-            loader = loader.endpoint_url(endpoint);
-        }
-        let region = self
-            .region
-            .clone()
-            .ok_or(anyhow!("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION was not set"))?;
+    /// Build the storage backend (S3 or Azure Blob) for this configuration.
+    /// `LIBSQL_BOTTOMLESS_PROVIDER` selects the backend; for `azure`,
+    /// `access_key_id`/`secret_access_key` carry the account name/key and
+    /// `bucket_name` is the container.
+    pub fn build_store(&self) -> Result<crate::store::BlobStore> {
         let access_key_id = self
             .access_key_id
             .clone()
@@ -144,28 +145,34 @@ impl Options {
         let secret_access_key = self.secret_access_key.clone().ok_or(anyhow!(
             "LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY was not set"
         ))?;
-        let session_token: Option<String> = self.session_token.clone();
-        let conf = loader
-            .behavior_version(BehaviorVersion::latest())
-            .region(Region::new(region))
-            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
-                access_key_id,
-                secret_access_key,
-                session_token,
-                None,
-                "Static",
-            )))
-            .retry_config(
-                aws_sdk_s3::config::retry::RetryConfig::standard()
-                    .with_max_attempts(self.s3_max_retries),
-            )
-            .build();
-
-        let s3_config = aws_sdk_s3::config::Builder::from(&conf)
-            .force_path_style(true)
-            .build();
-
-        Ok(s3_config)
+        let provider = self
+            .provider
+            .as_deref()
+            .unwrap_or("s3")
+            .to_ascii_lowercase();
+        match provider.as_str() {
+            "azure" | "azureblob" | "azblob" => crate::store::BlobStore::azure(
+                access_key_id,            // storage account name
+                secret_access_key,        // storage account key
+                self.bucket_name.clone(), // container
+                self.aws_endpoint.clone(),
+            ),
+            "s3" => {
+                let region = self
+                    .region
+                    .clone()
+                    .ok_or(anyhow!("LIBSQL_BOTTOMLESS_AWS_DEFAULT_REGION was not set"))?;
+                crate::store::BlobStore::s3(
+                    self.aws_endpoint.clone(),
+                    region,
+                    self.bucket_name.clone(),
+                    access_key_id,
+                    secret_access_key,
+                    self.session_token.clone(),
+                )
+            }
+            other => bail!("unknown LIBSQL_BOTTOMLESS_PROVIDER '{other}' (expected 's3' or 'azure')"),
+        }
     }
 
     pub fn from_env() -> Result<Self> {
@@ -245,6 +252,8 @@ impl Options {
         let skip_shutdown_upload =
             env_var_or("LIBSQL_BOTTOMLESS_SKIP_SHUTDOWN_UPLOAD", false).parse::<bool>()?;
 
+        let provider = env_var("LIBSQL_BOTTOMLESS_PROVIDER").ok();
+
         Ok(Options {
             db_id,
             create_bucket_if_not_exists: true,
@@ -259,6 +268,7 @@ impl Options {
             secret_access_key,
             session_token,
             region,
+            provider,
             bucket_name,
             s3_max_retries,
             skip_snapshot,
@@ -321,26 +331,21 @@ impl Replicator {
     }
 
     pub async fn with_options<S: Into<String>>(db_path: S, options: Options) -> Result<Self> {
-        let config = options.client_config().await?;
-        let client = Client::from_conf(config);
+        let store = options.build_store()?;
         let bucket = options.bucket_name.clone();
         let generation = Arc::new(ArcSwapOption::default());
 
-        match client.head_bucket().bucket(&bucket).send().await {
-            Ok(_) => tracing::info!("Bucket {} exists and is accessible", bucket),
-            Err(SdkError::ServiceError(err)) if err.err().is_not_found() => {
-                if options.create_bucket_if_not_exists {
-                    tracing::info!("Bucket {} not found, recreating", bucket);
-                    client.create_bucket().bucket(&bucket).send().await?;
-                } else {
-                    tracing::error!("Bucket {} does not exist", bucket);
-                    return Err(SdkError::ServiceError(err).into());
-                }
-            }
-            Err(e) => {
-                tracing::error!("Bucket checking error: {}", e);
-                return Err(e.into());
-            }
+        // object_store has no bucket/container CRUD: the target must pre-exist
+        // (created out-of-band). We only probe reachability here.
+        if store.accessible().await {
+            tracing::info!("Bucket {} exists and is accessible", bucket);
+        } else if options.create_bucket_if_not_exists {
+            tracing::warn!(
+                "Bucket {} not reachable yet; assuming it is created out-of-band or on first write",
+                bucket
+            );
+        } else {
+            return Err(anyhow!("Bucket {} does not exist or is not accessible", bucket));
         }
 
         let db_path = db_path.into();
@@ -425,7 +430,7 @@ impl Replicator {
         let (upload_progress, last_uploaded_frame_no) = CompletionProgress::new(0);
         let upload_progress = Arc::new(Mutex::new(upload_progress));
         let _s3_upload = {
-            let client = client.clone();
+            let store = store.clone();
             let bucket = options.bucket_name.clone();
             let max_parallelism = options.s3_max_parallelism;
             let upload_progress = upload_progress.clone();
@@ -439,7 +444,7 @@ impl Replicator {
                     let start = Instant::now();
                     let sem = sem.clone();
                     let permit = sem.acquire_owned().await.unwrap();
-                    let client = client.clone();
+                    let store = store.clone();
                     let bucket = bucket.clone();
                     let upload_progress = upload_progress.clone();
 
@@ -454,14 +459,8 @@ impl Replicator {
                         let fpath = format!("{}/{}", &bucket, &req.path);
                         loop {
                             let start_time = Instant::now();
-                            let body = ByteStream::from_path(&fpath).await.unwrap();
-                            let response = client
-                                .put_object()
-                                .bucket(&bucket)
-                                .key(&req.path)
-                                .body(body)
-                                .send()
-                                .await;
+                            let response =
+                                store.put_file(&req.path, std::path::Path::new(&fpath)).await;
                             Self::record_s3_write_time(&db_name, start_time.elapsed());
                             if response.is_ok() {
                                 break;
@@ -490,7 +489,7 @@ impl Replicator {
         };
         let (snapshot_notifier, snapshot_waiter) = channel(Ok(None));
         Ok(Self {
-            client,
+            store,
             bucket,
             page_size: Self::UNSET_PAGE_SIZE,
             generation,
@@ -522,22 +521,17 @@ impl Replicator {
             Some(db_id) => format!("{db_id}-"),
             None => format!("ns-:{}-", db_name.as_ref()),
         };
-        let config = options.client_config().await?;
-        let client = Client::from_conf(config);
+        let store = options.build_store()?;
         let bucket = options.bucket_name.clone();
 
-        match client.head_bucket().bucket(&bucket).send().await {
-            Ok(_) => tracing::trace!("Bucket {bucket} exists and is accessible"),
-            Err(e) => {
-                tracing::trace!("Bucket checking error: {e}");
-                return Err(e.into());
-            }
+        if !store.accessible().await {
+            tracing::trace!("Bucket {bucket} not accessible");
+            return Err(anyhow!("Bucket {bucket} does not exist or is not accessible"));
         }
 
         let mut last_frame = 0;
-        let list_objects = client.list_objects().bucket(&bucket).prefix(&prefix);
-        let response = list_objects.send().await?;
-        let _ = Self::try_get_last_frame_no(response, &mut last_frame);
+        let objs = store.list_all(&prefix, None, None).await?;
+        let _ = Self::try_get_last_frame_no(&objs, &mut last_frame);
         tracing::trace!("Last frame of {prefix}: {last_frame}");
 
         Ok(last_frame > 0)
@@ -1842,18 +1836,15 @@ impl Replicator {
         Ok(last_frame)
     }
 
-    fn try_get_last_frame_no(response: ListObjectsOutput, frame_no: &mut u32) -> Option<String> {
-        let objs = response.contents();
+    fn try_get_last_frame_no(objs: &[crate::store::ObjMeta], frame_no: &mut u32) -> Option<String> {
         let mut last_key = None;
         for obj in objs {
-            last_key = Some(obj.key()?);
-            if let Some(key) = last_key {
-                if let Some((_, last_frame_no, _, _)) = Self::parse_frame_range(key) {
-                    *frame_no = last_frame_no;
-                }
+            last_key = Some(obj.key.clone());
+            if let Some((_, last_frame_no, _, _)) = Self::parse_frame_range(&obj.key) {
+                *frame_no = last_frame_no;
             }
         }
-        last_key.map(String::from)
+        last_key
     }
 
     async fn upload_remaining_files(&self, generation: &Uuid) -> Result<()> {
@@ -1867,20 +1858,11 @@ impl Replicator {
                 if let Some(key) = Self::fpath_to_key(&fpath, &prefix) {
                     tracing::trace!("Requesting upload of the remaining backup file: {}", key);
                     let permit = sem.clone().acquire_owned().await?;
-                    let bucket = self.bucket.clone();
                     let key = key.to_string();
-                    let client = self.client.clone();
+                    let store = self.store.clone();
                     tokio::spawn(async move {
-                        let body = ByteStream::from_path(&fpath).await.unwrap();
-                        if let Err(e) = client
-                            .put_object()
-                            .bucket(bucket)
-                            .key(key.clone())
-                            .body(body)
-                            .send()
-                            .await
-                        {
-                            tracing::error!("Failed to send {} to S3: {}", key, e);
+                        if let Err(e) = store.put_file(&key, &fpath).await {
+                            tracing::error!("Failed to send {} to storage: {}", key, e);
                         } else {
                             tokio::fs::remove_file(&fpath).await.unwrap();
                             tracing::trace!("Uploaded to S3: {}", key);
