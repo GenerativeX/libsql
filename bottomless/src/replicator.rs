@@ -136,11 +136,15 @@ impl Options {
         let secret_access_key = self.secret_access_key.clone().ok_or(anyhow!(
             "LIBSQL_BOTTOMLESS_AWS_SECRET_ACCESS_KEY was not set"
         ))?;
+        // Honour the field if set, else fall back to the env var so manual
+        // `Options { .. }` constructions (which bypass `from_env`) still select
+        // the backend.
         let provider = self
             .provider
-            .as_deref()
-            .unwrap_or("s3")
-            .to_ascii_lowercase();
+            .clone()
+            .or_else(|| std::env::var("LIBSQL_BOTTOMLESS_PROVIDER").ok())
+            .map(|p| p.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "s3".to_string());
         match provider.as_str() {
             "azure" | "azureblob" | "azblob" => crate::store::BlobStore::azure(
                 access_key_id,            // storage account name
