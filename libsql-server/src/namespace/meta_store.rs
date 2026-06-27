@@ -124,6 +124,7 @@ pub async fn metastore_connection_maker(
                 session_token: config.session_token,
                 region: Some(config.region),
                 db_id: Some(config.backup_id),
+                provider: None,
                 bucket_name: config.bucket_name,
                 max_frames_per_batch: 10_000,
                 max_batch_interval: config.backup_interval,
