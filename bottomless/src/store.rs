@@ -19,13 +19,13 @@ use futures::StreamExt;
 use object_store::{path::Path, ObjectStore, PutPayload, WriteMultipart};
 use std::ops::Range;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::{AsyncBufRead, AsyncReadExt};
 use tokio_util::io::StreamReader;
 
 /// A storage backend (S3 or Azure) scoped to a single bucket / container.
 /// Keys are object paths *within* that bucket (no bucket prefix), matching the
 /// `object_store` model.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct BlobStore {
     inner: Arc<dyn ObjectStore>,
     /// Bucket (S3) or container (Azure) name — for logs / diagnostics only.
@@ -115,7 +115,10 @@ impl BlobStore {
 
     /// Streaming reader for large objects (db snapshots, frame batches).
     /// `None` if the key does not exist.
-    pub async fn get_reader(&self, key: &str) -> Result<Option<impl AsyncRead + Unpin>> {
+    pub async fn get_reader(
+        &self,
+        key: &str,
+    ) -> Result<Option<impl AsyncBufRead + Send + Unpin + 'static>> {
         match self.inner.get(&obj_path(key)).await {
             Ok(r) => {
                 let stream = r.into_stream().map(|res| {
@@ -195,6 +198,20 @@ impl BlobStore {
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.inner.delete(&obj_path(key)).await?;
         Ok(())
+    }
+
+    /// List the immediate "subdirectories" under `prefix` (delimiter `/`),
+    /// returned WITH a trailing slash to match S3 `CommonPrefixes` formatting.
+    pub async fn list_common_prefixes(&self, prefix: &str) -> Result<Vec<String>> {
+        let res = self
+            .inner
+            .list_with_delimiter(Some(&obj_path(prefix)))
+            .await?;
+        Ok(res
+            .common_prefixes
+            .into_iter()
+            .map(|p| format!("{}/", p.as_ref()))
+            .collect())
     }
 
     /// Best-effort reachability probe for the bucket/container.

@@ -6,15 +6,6 @@ use crate::wal::WalFileReader;
 use anyhow::{anyhow, bail};
 use arc_swap::ArcSwapOption;
 use async_compression::tokio::write::{GzipEncoder, ZstdEncoder};
-use aws_config::BehaviorVersion;
-use aws_sdk_s3::config::{Credentials, Region, SharedCredentialsProvider};
-use aws_sdk_s3::error::SdkError;
-use aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder;
-use aws_sdk_s3::operation::get_object::GetObjectError;
-use aws_sdk_s3::operation::list_objects::builders::ListObjectsFluentBuilder;
-use aws_sdk_s3::operation::list_objects::ListObjectsOutput;
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::{Client, Config};
 use bytes::{Buf, Bytes};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use libsql_replication::injector::Injector as _;
@@ -712,15 +703,6 @@ impl Replicator {
         Ok(())
     }
 
-    // Gets an object from the current bucket
-    fn get_object(&self, key: String) -> GetObjectFluentBuilder {
-        self.client.get_object().bucket(&self.bucket).key(key)
-    }
-
-    // Lists objects from the current bucket
-    fn list_objects(&self) -> ListObjectsFluentBuilder {
-        self.client.list_objects().bucket(&self.bucket)
-    }
 
     fn reset_frames(&mut self, frame_no: u32) {
         let last_sent = self.last_sent_frame_no();
@@ -796,16 +778,10 @@ impl Replicator {
     /// extra undesired latency and this method may be called during SQLite checkpoint.
     fn store_dependency(&self, prev: Uuid, curr: Uuid) {
         let key = format!("{}-{}/.dep", self.db_name, curr);
-        let request =
-            self.client
-                .put_object()
-                .bucket(&self.bucket)
-                .key(key)
-                .body(ByteStream::from(Bytes::copy_from_slice(
-                    prev.into_bytes().as_slice(),
-                )));
+        let store = self.store.clone();
+        let body = Bytes::copy_from_slice(prev.into_bytes().as_slice());
         tokio::spawn(async move {
-            if let Err(e) = request.send().await {
+            if let Err(e) = store.put_bytes(&key, body).await {
                 tracing::error!(
                     "Failed to store dependency between generations {} -> {}: {}",
                     prev,
@@ -824,24 +800,12 @@ impl Replicator {
 
     pub async fn get_dependency(&self, generation: &Uuid) -> Result<Option<Uuid>> {
         let key = format!("{}-{}/.dep", self.db_name, generation);
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
-        match resp {
-            Ok(out) => {
-                let bytes = out.body.collect().await?.into_bytes();
+        match self.store.get_bytes(&key).await? {
+            Some(bytes) => {
                 let prev_generation = Uuid::from_bytes(bytes.as_ref().try_into()?);
                 Ok(Some(prev_generation))
             }
-            Err(SdkError::ServiceError(se)) => match se.into_err() {
-                GetObjectError::NoSuchKey(_) => Ok(None),
-                e => Err(e.into()),
-            },
-            Err(e) => Err(e.into()),
+            None => Ok(None),
         }
     }
 
@@ -953,12 +917,12 @@ impl Replicator {
     pub async fn maybe_compress_main_db_file(
         db_path: &Path,
         compression: CompressionKind,
-    ) -> Result<ByteStream> {
+    ) -> Result<PathBuf> {
         if !tokio::fs::try_exists(db_path).await? {
             bail!("database file was not found at `{}`", db_path.display())
         }
         match compression {
-            CompressionKind::None => Ok(ByteStream::from_path(db_path).await?),
+            CompressionKind::None => Ok(db_path.to_path_buf()),
             CompressionKind::Gzip => {
                 let mut reader = File::open(db_path).await?;
                 let gzip_path = Self::db_compressed_path(db_path, "gz");
@@ -977,7 +941,7 @@ impl Replicator {
                     size,
                     gzip_path.display()
                 );
-                Ok(ByteStream::from_path(gzip_path).await?)
+                Ok(gzip_path)
             }
             CompressionKind::Zstd => {
                 let mut reader = File::open(db_path).await?;
@@ -997,7 +961,7 @@ impl Replicator {
                     size,
                     zstd_path.display()
                 );
-                Ok(ByteStream::from_path(zstd_path).await?)
+                Ok(zstd_path)
             }
         }
     }
@@ -1084,12 +1048,9 @@ impl Replicator {
         }
         let generation = self.generation()?;
         let start_ts = Instant::now();
-        let client = self.client.clone();
+        let store = self.store.clone();
         let change_counter = self.read_change_counter()?;
-        let snapshot_req = client.put_object().bucket(self.bucket.clone()).key(format!(
-            "{}-{}/db.{}",
-            self.db_name, generation, self.use_compression
-        ));
+        let snapshot_key = format!("{}-{}/db.{}", self.db_name, generation, self.use_compression);
 
         /* FIXME: we can't rely on the change counter in WAL mode:
          ** "In WAL mode, changes to the database are detected using the wal-index and
@@ -1098,14 +1059,6 @@ impl Replicator {
          ** Instead, we need to consult WAL checksums.
          */
         let change_counter_key = format!("{}-{}/.changecounter", self.db_name, generation);
-        let change_counter_req = self
-            .client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(change_counter_key)
-            .body(ByteStream::from(Bytes::copy_from_slice(
-                change_counter.as_ref(),
-            )));
         let snapshot_notifier = self.snapshot_notifier.clone();
         let compression = self.use_compression;
         let db_path = PathBuf::from(self.db_path.clone());
@@ -1113,7 +1066,8 @@ impl Replicator {
         let handle = tokio::spawn(async move {
             tracing::trace!("Start snapshotting generation {}", generation);
             let start = Instant::now();
-            let body = match Self::maybe_compress_main_db_file(&db_path, compression).await {
+            let snapshot_path = match Self::maybe_compress_main_db_file(&db_path, compression).await
+            {
                 Ok(file) => file,
                 Err(e) => {
                     tracing::error!(
@@ -1126,24 +1080,28 @@ impl Replicator {
                     return;
                 }
             };
-            let mut result = snapshot_req.body(body).send().await;
-            if let Err(e) = result {
+            if let Err(e) = store.put_file(&snapshot_key, &snapshot_path).await {
                 tracing::error!(
                     "Failed to upload snapshot for generation {}: {:?}",
                     generation,
                     e
                 );
-                let _ = snapshot_notifier.send(Err(e.into()));
+                let _ = snapshot_notifier.send(Err(e));
                 return;
             }
-            result = change_counter_req.send().await;
-            if let Err(e) = result {
+            if let Err(e) = store
+                .put_bytes(
+                    &change_counter_key,
+                    Bytes::copy_from_slice(change_counter.as_ref()),
+                )
+                .await
+            {
                 tracing::error!(
                     "Failed to upload change counter for generation {}: {:?}",
                     generation,
                     e
                 );
-                let _ = snapshot_notifier.send(Err(e.into()));
+                let _ = snapshot_notifier.send(Err(e));
                 return;
             }
             let _ = snapshot_notifier.send(Ok(Some(generation)));
@@ -1171,71 +1129,54 @@ impl Replicator {
         timestamp: Option<&NaiveDateTime>,
     ) -> Option<Uuid> {
         tracing::debug!("last generation before");
-        let mut next_marker: Option<String> = None;
         let prefix = format!("{}-", self.db_name);
         let threshold = timestamp.map(|ts| ts.and_utc().timestamp() as u64);
-        loop {
-            let mut request = self.list_objects().prefix(prefix.clone());
-            if threshold.is_none() {
-                request = request.max_keys(1);
-            }
-            if let Some(marker) = next_marker.take() {
-                request = request.marker(marker);
-            }
-            let response = request.send().await.ok()?;
-            let objs = response.contents();
-            if objs.is_empty() {
-                tracing::debug!("no objects found in bucket");
-                break;
-            }
-            let mut last_key = None;
-            let mut last_gen = None;
-            for obj in objs {
-                let key = obj.key();
-                last_key = key;
-                if let Some(key) = last_key {
-                    let key = match key.find('/') {
-                        Some(index) => &key[self.db_name.len() + 1..index],
-                        None => key,
-                    };
-
-                    if Some(key) != last_gen {
-                        last_gen = Some(key);
-                        if let Ok(generation) = Uuid::parse_str(key) {
-                            match threshold.as_ref() {
-                                None => return Some(generation),
-                                Some(threshold) => match Self::generation_to_timestamp(&generation)
-                                {
-                                    None => {
-                                        tracing::warn!(
-                                            "Generation {} is not valid UUID v7",
-                                            generation
-                                        );
-                                    }
-                                    Some(ts) => {
-                                        let (unix_seconds, _) = ts.to_unix();
-                                        if tracing::enabled!(tracing::Level::DEBUG) {
-                                            let ts = Utc
-                                                .timestamp_millis_opt((unix_seconds * 1000) as i64)
-                                                .unwrap()
-                                                .to_rfc3339();
-                                            tracing::debug!(
-                                                "Generation candidate: {} - timestamp: {}",
-                                                generation,
-                                                ts
-                                            );
-                                        }
-                                        if &unix_seconds <= threshold {
-                                            return Some(generation);
-                                        }
-                                    }
-                                },
+        // Without a threshold we only need the newest generation: a single object
+        // is enough since listing is lexicographically sorted (uuid v7 is reversed
+        // so the newest generation sorts first).
+        let max = if threshold.is_none() { Some(1) } else { None };
+        let objs = self.store.list_all(&prefix, max, None).await.ok()?;
+        if objs.is_empty() {
+            tracing::debug!("no objects found in bucket");
+            return None;
+        }
+        let mut last_gen = None;
+        for obj in &objs {
+            let key = obj.key.as_str();
+            let key = match key.find('/') {
+                Some(index) => &key[self.db_name.len() + 1..index],
+                None => key,
+            };
+            if Some(key) != last_gen {
+                last_gen = Some(key);
+                if let Ok(generation) = Uuid::parse_str(key) {
+                    match threshold.as_ref() {
+                        None => return Some(generation),
+                        Some(threshold) => match Self::generation_to_timestamp(&generation) {
+                            None => {
+                                tracing::warn!("Generation {} is not valid UUID v7", generation);
                             }
-                        }
+                            Some(ts) => {
+                                let (unix_seconds, _) = ts.to_unix();
+                                if tracing::enabled!(tracing::Level::DEBUG) {
+                                    let ts = Utc
+                                        .timestamp_millis_opt((unix_seconds * 1000) as i64)
+                                        .unwrap()
+                                        .to_rfc3339();
+                                    tracing::debug!(
+                                        "Generation candidate: {} - timestamp: {}",
+                                        generation,
+                                        ts
+                                    );
+                                }
+                                if &unix_seconds <= threshold {
+                                    return Some(generation);
+                                }
+                            }
+                        },
                     }
                 }
             }
-            next_marker = last_key.map(String::from);
         }
         None
     }
@@ -1243,16 +1184,11 @@ impl Replicator {
     // Tries to fetch the remote database change counter from given generation
     pub async fn get_remote_change_counter(&self, generation: &Uuid) -> Result<[u8; 4]> {
         let mut remote_change_counter = [0u8; 4];
-        if let Ok(response) = self
-            .get_object(format!("{}-{}/.changecounter", self.db_name, generation))
-            .send()
-            .await
-        {
-            response
-                .body
-                .collect()
-                .await?
-                .copy_to_slice(&mut remote_change_counter)
+        let key = format!("{}-{}/.changecounter", self.db_name, generation);
+        if let Some(bytes) = self.store.get_bytes(&key).await? {
+            if bytes.len() >= 4 {
+                remote_change_counter.copy_from_slice(&bytes[..4]);
+            }
         }
         Ok(remote_change_counter)
     }
@@ -1527,8 +1463,7 @@ impl Replicator {
                 CompressionKind::Gzip => format!("{}-{}/db.gz", self.db_name, generation),
                 CompressionKind::Zstd => format!("{}-{}/db.zstd", self.db_name, generation),
             };
-            if let Ok(db_file) = self.get_object(main_db_path).send().await {
-                let mut body_reader = db_file.body.into_async_read();
+            if let Some(mut body_reader) = self.store.get_reader(&main_db_path).await? {
                 let db_size = match algo {
                     CompressionKind::None => tokio::io::copy(&mut body_reader, db).await?,
                     CompressionKind::Gzip => {
@@ -1581,28 +1516,15 @@ impl Replicator {
             unsafe { v.set_len(page_size) };
             v
         };
-        let mut next_marker = None;
         let mut applied_wal_frame = false;
         let mut last_injected_frame_no = 0;
-        'restore_wal: loop {
-            let mut list_request = self.list_objects().prefix(&prefix);
-            if let Some(marker) = next_marker {
-                list_request = list_request.marker(marker);
-            }
-            let response = list_request.send().await?;
-
-            let objs = response.contents();
-
-            if objs.is_empty() {
-                tracing::debug!("No objects found in generation {}", generation);
-                break;
-            }
-
-            for obj in objs {
-                let key = obj
-                    .key()
-                    .ok_or_else(|| anyhow::anyhow!("Failed to get key for an object"))?;
-                tracing::debug!("Loading {}", key);
+        let objs = self.store.list_all(&prefix, None, None).await?;
+        if objs.is_empty() {
+            tracing::debug!("No objects found in generation {}", generation);
+        }
+        'restore_wal: for obj in &objs {
+            let key = obj.key.as_str();
+            tracing::debug!("Loading {}", key);
 
                 let (first_frame_no, last_frame_no, timestamp, compression_kind) =
                     match Self::parse_frame_range(key) {
@@ -1646,10 +1568,14 @@ impl Replicator {
                         }
                     }
                 }
-                let frame = self.get_object(key.into()).send().await?;
+                let frame_reader = self
+                    .store
+                    .get_reader(key)
+                    .await?
+                    .ok_or_else(|| anyhow!("frame object {key} not found"))?;
                 let mut reader = BatchReader::new(
                     first_frame_no,
-                    frame.body.into_async_read(),
+                    frame_reader,
                     self.page_size,
                     compression_kind,
                 );
@@ -1679,21 +1605,8 @@ impl Replicator {
                     injector.inject_frame(frame).await?;
                     applied_wal_frame = true;
                 }
-            }
-            next_marker = response
-                .is_truncated()
-                // This previously was not optional but when upgrading to the s3 sdk to 1.0 we must
-                // check for this situation, defaulting to true to stop the search seems safe. From
-                // https://docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjects.html#API_ListObjects_ResponseSyntax
-                // it looks like this value is always set.
-                .unwrap_or(true)
-                .then(|| objs.last().map(|elem| elem.key().unwrap().to_string()))
-                .flatten();
-            if next_marker.is_none() {
-                tracing::trace!("Restored DB from S3 backup using generation {}", generation);
-                break;
-            }
         }
+        tracing::trace!("Restored DB from backup using generation {}", generation);
         Ok(applied_wal_frame)
     }
 
@@ -1716,65 +1629,46 @@ impl Replicator {
         std::fs::create_dir_all(PathBuf::from(&to_dir))?;
 
         let prefix = format!("{}-{}/", self.db_name, generation);
-        let mut marker: Option<String> = None;
         tracing::info!(
             "ready to copy S3 content from directory {} to local directory {} (parallelism: {})",
             &prefix,
             &to_dir,
             self.s3_max_parallelism
         );
-        loop {
-            let mut list_request = self.list_objects().prefix(&prefix);
-            if let Some(marker) = marker.take() {
-                list_request = list_request.marker(marker);
-            }
-            let semaphore = Arc::new(Semaphore::new(self.s3_max_parallelism));
-            let mut group = JoinSet::new();
-            let list_response = list_request.send().await?;
-            for entry in list_response.contents() {
-                let key = String::from(entry.key().unwrap());
-                marker = Some(key.clone());
+        let objs = self.store.list_all(&prefix, None, None).await?;
+        let semaphore = Arc::new(Semaphore::new(self.s3_max_parallelism));
+        let mut group = JoinSet::new();
+        for entry in &objs {
+            let key = entry.key.clone();
+            let store = self.store.clone();
+            let to_dir = to_dir.clone();
+            let entry_size = entry.size;
+            let semaphore = semaphore.clone();
+            group.spawn(async move {
+                let acquired = semaphore.acquire().await.unwrap();
+                if let Ok(Some(mut body_reader)) = store.get_reader(&key).await {
+                    tracing::debug!("start copy of entry {} (size {} bytes)", &key, entry_size);
+                    let entry_name = key.split("/").last().unwrap();
+                    let mut entry_path = PathBuf::from(&to_dir);
+                    entry_path.push(entry_name);
 
-                let request = self
-                    .client
-                    .get_object()
-                    .bucket(&self.bucket)
-                    .key(key.clone());
-                let to_dir = to_dir.clone();
-                let entry_size = entry.size().unwrap_or(0);
-                let semaphore = semaphore.clone();
-                group.spawn(async move {
-                    let acquired = semaphore.acquire().await.unwrap();
-                    if let Ok(response) = request.send().await {
-                        tracing::debug!(
-                            "start copy of entry {} (size {} bytes)",
-                            &key,
-                            entry_size,
-                        );
-                        let entry_name = key.split("/").last().unwrap();
-                        let mut entry_path = PathBuf::from(&to_dir);
-                        entry_path.push(entry_name);
-
-                        let mut entry_file = OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .read(true)
-                            .truncate(true)
-                            .open(entry_path)
-                            .await
-                            .unwrap();
-                        let mut body_reader = response.body.into_async_read();
-                        tokio::io::copy(&mut body_reader, &mut entry_file).await.unwrap();
-                        tracing::debug!("finish copy of entry {}", &key);
-                    }
-                    drop(acquired);
-                });
-            }
-            while let Some(_) = group.join_next().await {}
-            if !marker.is_some() {
-                break;
-            }
+                    let mut entry_file = OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .read(true)
+                        .truncate(true)
+                        .open(entry_path)
+                        .await
+                        .unwrap();
+                    tokio::io::copy(&mut body_reader, &mut entry_file)
+                        .await
+                        .unwrap();
+                    tracing::debug!("finish copy of entry {}", &key);
+                }
+                drop(acquired);
+            });
         }
+        while group.join_next().await.is_some() {}
         Ok(())
     }
 
@@ -1822,17 +1716,9 @@ impl Replicator {
     pub async fn get_last_consistent_frame(&self, generation: &Uuid) -> Result<u32> {
         tracing::debug!("get last consistent frame");
         let prefix = format!("{}-{}/", self.db_name, generation);
-        let mut marker: Option<String> = None;
         let mut last_frame = 0;
-        while {
-            let mut list_objects = self.list_objects().prefix(&prefix);
-            if let Some(marker) = marker.take() {
-                list_objects = list_objects.marker(marker);
-            }
-            let response = list_objects.send().await?;
-            marker = Self::try_get_last_frame_no(response, &mut last_frame);
-            marker.is_some()
-        } {}
+        let objs = self.store.list_all(&prefix, None, None).await?;
+        let _ = Self::try_get_last_frame_no(&objs, &mut last_frame);
         Ok(last_frame)
     }
 
@@ -1910,28 +1796,13 @@ impl Replicator {
         body.extend_from_slice(page_size.to_be_bytes().as_slice());
         body.extend_from_slice(checksum.0.to_be_bytes().as_slice());
         body.extend_from_slice(checksum.1.to_be_bytes().as_slice());
-        let _ = self
-            .client
-            .put_object()
-            .bucket(self.bucket.clone())
-            .key(key)
-            .body(ByteStream::from(body))
-            .send()
-            .await?;
+        self.store.put_bytes(&key, Bytes::from(body)).await?;
         Ok(())
     }
 
     pub async fn get_metadata(&self, generation: &Uuid) -> Result<Option<(u32, (u32, u32))>> {
         let key = format!("{}-{}/.meta", self.db_name, generation);
-        if let Ok(obj) = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-        {
-            let mut data = obj.body.collect().await?;
+        if let Some(mut data) = self.store.get_bytes(&key).await? {
             let page_size = data.get_u32();
             let checksum = (data.get_u32(), data.get_u32());
             Ok(Some((page_size, checksum)))
@@ -1948,17 +1819,14 @@ impl Replicator {
         );
         let key = format!("{}.tombstone", self.db_name);
         let threshold = older_than.unwrap_or(NaiveDateTime::MAX);
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .body(ByteStream::from(
-                threshold.and_utc().timestamp().to_be_bytes().to_vec(),
-            ))
-            .send()
+        self.store
+            .put_bytes(
+                &key,
+                Bytes::from(threshold.and_utc().timestamp().to_be_bytes().to_vec()),
+            )
             .await?;
         let delete_task = DeleteAll::new(
-            self.client.clone(),
+            self.store.clone(),
             self.bucket.clone(),
             self.db_name.clone(),
             threshold,
@@ -1980,26 +1848,17 @@ impl Replicator {
     /// Checks if current replicator database has been marked as deleted.
     pub async fn get_tombstone(&self) -> Result<Option<NaiveDateTime>> {
         let key = format!("{}.tombstone", self.db_name);
-        let resp = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await;
-        match resp {
-            Ok(out) => {
+        match self.store.get_bytes(&key).await? {
+            Some(bytes) => {
                 let mut buf = [0u8; 8];
-                out.body.collect().await?.copy_to_slice(&mut buf);
+                if bytes.len() >= 8 {
+                    buf.copy_from_slice(&bytes[..8]);
+                }
                 let timestamp = i64::from_be_bytes(buf);
                 let tombstone = DateTime::from_timestamp(timestamp, 0).map(|t| t.naive_utc());
                 Ok(tombstone)
             }
-            Err(SdkError::ServiceError(se)) => match se.into_err() {
-                GetObjectError::NoSuchKey(_) => Ok(None),
-                e => Err(e.into()),
-            },
-            Err(e) => Err(e.into()),
+            None => Ok(None),
         }
     }
 }
@@ -2009,16 +1868,21 @@ impl Replicator {
 /// performs hard deletion of corresponding S3 objects.
 #[derive(Debug)]
 pub struct DeleteAll {
-    client: Client,
+    store: crate::store::BlobStore,
     bucket: String,
     db_name: String,
     threshold: NaiveDateTime,
 }
 
 impl DeleteAll {
-    fn new(client: Client, bucket: String, db_name: String, threshold: NaiveDateTime) -> Self {
+    fn new(
+        store: crate::store::BlobStore,
+        bucket: String,
+        db_name: String,
+        threshold: NaiveDateTime,
+    ) -> Self {
         DeleteAll {
-            client,
+            store,
             bucket,
             db_name,
             threshold,
@@ -2032,46 +1896,23 @@ impl DeleteAll {
     /// Performs hard deletion of all bottomless generations older than timestamp provided in
     /// current request.
     pub async fn commit(self) -> Result<u32> {
-        let mut next_marker = None;
         let mut removed_count = 0;
-        loop {
-            let mut list_request = self
-                .client
-                .list_objects()
-                .bucket(&self.bucket)
-                .set_delimiter(Some("/".to_string()))
-                .prefix(&self.db_name);
-
-            if let Some(marker) = next_marker {
-                list_request = list_request.marker(marker)
-            }
-
-            let response = list_request.send().await?;
-            let prefixes = response.common_prefixes();
-
-            if prefixes.is_empty() {
-                tracing::debug!("no generations found to delete");
-                return Ok(0);
-            }
-
-            for prefix in prefixes {
-                if let Some(prefix) = &prefix.prefix {
-                    let prefix = &prefix[self.db_name.len() + 1..prefix.len() - 1];
-                    let uuid = Uuid::try_parse(prefix)?;
-                    if let Some(datetime) = Replicator::generation_to_timestamp(&uuid) {
-                        if datetime.to_unix().0 >= self.threshold.and_utc().timestamp() as u64 {
-                            continue;
-                        }
-                        tracing::debug!("Removing generation {}", uuid);
-                        self.remove(uuid).await?;
-                        removed_count += 1;
-                    }
+        let prefixes = self.store.list_common_prefixes(&self.db_name).await?;
+        if prefixes.is_empty() {
+            tracing::debug!("no generations found to delete");
+            return Ok(0);
+        }
+        for prefix in &prefixes {
+            // `prefix` is `{db_name}-{uuid}/`
+            let inner = &prefix[self.db_name.len() + 1..prefix.len() - 1];
+            let uuid = Uuid::try_parse(inner)?;
+            if let Some(datetime) = Replicator::generation_to_timestamp(&uuid) {
+                if datetime.to_unix().0 >= self.threshold.and_utc().timestamp() as u64 {
+                    continue;
                 }
-            }
-
-            next_marker = response.next_marker().map(|s| s.to_owned());
-            if next_marker.is_none() {
-                break;
+                tracing::debug!("Removing generation {}", uuid);
+                self.remove(uuid).await?;
+                removed_count += 1;
             }
         }
         tracing::debug!("Removed {} generations", removed_count);
@@ -2081,55 +1922,21 @@ impl DeleteAll {
 
     pub async fn remove_tombstone(&self) -> Result<()> {
         let key = format!("{}.tombstone", self.db_name);
-        self.client
-            .delete_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await?;
+        self.store.delete(&key).await?;
         Ok(())
     }
 
     async fn remove(&self, generation: Uuid) -> Result<()> {
         let mut removed = 0;
-        let mut next_marker = None;
-        loop {
-            let mut list_request = self
-                .client
-                .list_objects()
-                .bucket(&self.bucket)
-                .prefix(format!("{}-{}/", &self.db_name, generation));
-
-            if let Some(marker) = next_marker {
-                list_request = list_request.marker(marker)
-            }
-
-            let response = list_request.send().await?;
-            let objs = response.contents();
-
-            if objs.is_empty() {
-                return Ok(());
-            }
-
-            for obj in objs {
-                if let Some(key) = obj.key() {
-                    tracing::trace!("Removing {}", key);
-                    self.client
-                        .delete_object()
-                        .bucket(&self.bucket)
-                        .key(key)
-                        .send()
-                        .await?;
-                    removed += 1;
-                }
-            }
-
-            next_marker = response.next_marker().map(|s| s.to_owned());
-            if next_marker.is_none() {
-                tracing::trace!("Removed {} snapshot generations", removed);
-                return Ok(());
-            }
+        let prefix = format!("{}-{}/", &self.db_name, generation);
+        let objs = self.store.list_all(&prefix, None, None).await?;
+        for obj in &objs {
+            tracing::trace!("Removing {}", obj.key);
+            self.store.delete(&obj.key).await?;
+            removed += 1;
         }
+        tracing::trace!("Removed {} snapshot generations", removed);
+        Ok(())
     }
 }
 

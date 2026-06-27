@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::pin::Pin;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt, BufReader};
 
-type AsyncByteReader = dyn AsyncRead + Send + Sync;
+type AsyncByteReader = dyn AsyncRead + Send;
 
 pub struct BatchReader {
     reader: Pin<Box<AsyncByteReader>>,
@@ -16,7 +16,7 @@ pub struct BatchReader {
 impl BatchReader {
     pub fn new(
         init_frame_no: u32,
-        content_stream: impl AsyncBufRead + Send + Sync + 'static,
+        content_stream: impl AsyncBufRead + Send + 'static,
         page_size: usize,
         use_compression: CompressionKind,
     ) -> Self {
