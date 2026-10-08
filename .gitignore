@@ -13,3 +13,8 @@ libsql-sqlite3/**.o.tmp
 /bindings/c/generated
 /bindings/c/**.xcframework
 /bindings/**/.DS_Store
+
+# >>> gx-env >>>
+# Plaintext written by gx-env inject. Never commit these.
+.env.local
+# <<< gx-env <<<
