@@ -5,7 +5,10 @@
     "local": {
       "output": ".env.local"
     },
-    "test": {}
+    "test": {},
+    "prod": {
+      "shell": false
+    }
   },
   "project": "libsql"
 }
