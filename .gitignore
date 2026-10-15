@@ -18,3 +18,11 @@ libsql-sqlite3/**.o.tmp
 # Plaintext written by gx-env inject. Never commit these.
 .env.local
 # <<< gx-env <<<
+
+# env files: values live in gx-env (Dev Hub). Only templates are tracked.
+.env
+.env.*
+!.env*.example
+!.env.example*
+!.env*.template
+!.env*.sample
